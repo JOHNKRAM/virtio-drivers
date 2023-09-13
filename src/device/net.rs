@@ -8,7 +8,7 @@ use crate::{Error, Result};
 use alloc::{vec, vec::Vec};
 use bitflags::bitflags;
 use core::{convert::TryInto, mem::size_of};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use zerocopy::{AsBytes, FromBytes};
 
 const MAX_BUFFER_LEN: usize = 65535;
@@ -106,6 +106,7 @@ pub struct VirtIONet<H: Hal, T: Transport, const QUEUE_SIZE: usize> {
     mac: EthernetAddress,
     recv_queue: VirtQueue<H, QUEUE_SIZE>,
     send_queue: VirtQueue<H, QUEUE_SIZE>,
+    ctrl_queue: Option<VirtQueue<H, QUEUE_SIZE>>,
     rx_buffers: [Option<RxBuffer>; QUEUE_SIZE],
 }
 
@@ -116,9 +117,19 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
         // read configuration space
         let config = transport.config_space::<Config>()?;
         let mac;
+        let max_virtqueue_pairs;
         // Safe because config points to a valid MMIO region for the config space.
         unsafe {
             mac = volread!(config, mac);
+            max_virtqueue_pairs = if negotiated_features.intersects(Features::MQ) {
+                info!(
+                    "max_virtqueue_pairs={:?}",
+                    volread!(config, max_virtqueue_pairs),
+                );
+                volread!(config, max_virtqueue_pairs)
+            } else {
+                1
+            };
             debug!(
                 "Got MAC={:02x?}, status={:?}",
                 mac,
@@ -147,6 +158,17 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
             negotiated_features.contains(Features::RING_EVENT_IDX),
         )?;
 
+        let ctrl_queue = if negotiated_features.contains(Features::CTRL_VQ) {
+            Some(VirtQueue::new(
+                &mut transport,
+                max_virtqueue_pairs << 1,
+                false,
+                negotiated_features.contains(Features::RING_EVENT_IDX),
+            )?)
+        } else {
+            None
+        };
+
         const NONE_BUF: Option<RxBuffer> = None;
         let mut rx_buffers = [NONE_BUF; QUEUE_SIZE];
         for (i, rx_buf_place) in rx_buffers.iter_mut().enumerate() {
@@ -169,6 +191,7 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
             recv_queue,
             send_queue,
             rx_buffers,
+            ctrl_queue,
         })
     }
 
@@ -410,4 +433,6 @@ const QUEUE_RECEIVE: u16 = 0;
 const QUEUE_TRANSMIT: u16 = 1;
 const SUPPORTED_FEATURES: Features = Features::MAC
     .union(Features::STATUS)
-    .union(Features::RING_EVENT_IDX);
+    .union(Features::RING_EVENT_IDX)
+    .union(Features::CTRL_VQ)
+    .union(Features::MQ);
