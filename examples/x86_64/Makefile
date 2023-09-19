@@ -31,7 +31,7 @@ QEMU_ARGS += \
 	-kernel $(kernel) \
 	-device virtio-gpu-pci -vga none \
 	-device virtio-blk-pci,drive=x0 -drive file=$(img),if=none,format=raw,id=x0 \
-	-device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=tcp::5555-:5555
+	-device virtio-net-pci,netdev=net0,mq=on,vectors=18 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=on,queues=8
 
 ifeq ($(accel), on)
 	QEMU_ARGS += -cpu host -accel kvm
@@ -60,7 +60,7 @@ clean:
 
 qemu: kernel $(img)
 # Wait a few seconds, then try to open a connection to the VM so it can test its networking.
-	( sleep 4 && echo "hello" | nc localhost 5555 -N -v) &
+	( sleep 4 && echo "hello" | nc 10.0.2.15 5555 -N -v) &
 	qemu-system-$(arch) $(QEMU_ARGS)
 
 $(img):
