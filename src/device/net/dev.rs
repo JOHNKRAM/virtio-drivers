@@ -1,4 +1,4 @@
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 
 use super::net_buf::{RxBuffer, TxBuffer};
 use super::{EthernetAddress, VirtIONetRaw};
@@ -19,25 +19,33 @@ use crate::{hal::Hal, transport::Transport, Error, Result};
 /// A third command queue is used to control advanced filtering features.
 pub struct VirtIONet<H: Hal, T: Transport, const QUEUE_SIZE: usize> {
     inner: VirtIONetRaw<H, T, QUEUE_SIZE>,
-    rx_buffers: [Option<RxBuffer>; QUEUE_SIZE],
+    rx_buffers: Vec<[Option<RxBuffer>; QUEUE_SIZE]>,
 }
 
 impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> {
     /// Create a new VirtIO-Net driver.
     pub fn new(transport: T, buf_len: usize) -> Result<Self> {
         let mut inner = VirtIONetRaw::new(transport)?;
+        let queue_count = inner.queue_count();
 
         const NONE_BUF: Option<RxBuffer> = None;
-        let mut rx_buffers = [NONE_BUF; QUEUE_SIZE];
-        for (i, rx_buf_place) in rx_buffers.iter_mut().enumerate() {
-            let mut rx_buf = RxBuffer::new(i, buf_len);
-            // Safe because the buffer lives as long as the queue.
-            let token = unsafe { inner.receive_begin(rx_buf.as_bytes_mut())? };
-            assert_eq!(token, i as u16);
-            *rx_buf_place = Some(rx_buf);
+        let mut all_rx_buffers = Vec::new();
+        for id in 0..queue_count {
+            let mut rx_buffers = [NONE_BUF; QUEUE_SIZE];
+            for (i, rx_buf_place) in rx_buffers.iter_mut().enumerate() {
+                let mut rx_buf = RxBuffer::new(i, buf_len);
+                // Safe because the buffer lives as long as the queue.
+                let token = unsafe { inner.receive_begin(id, rx_buf.as_bytes_mut())? };
+                assert_eq!(token, i as u16);
+                *rx_buf_place = Some(rx_buf);
+            }
+            all_rx_buffers.push(rx_buffers);
         }
 
-        Ok(VirtIONet { inner, rx_buffers })
+        Ok(VirtIONet {
+            inner,
+            rx_buffers: all_rx_buffers,
+        })
     }
 
     /// Acknowledge interrupt.
@@ -46,13 +54,13 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
     }
 
     /// Disable interrupts.
-    pub fn disable_interrupts(&mut self) {
-        self.inner.disable_interrupts()
+    pub fn disable_interrupts(&mut self, id: usize) {
+        self.inner.disable_interrupts(id)
     }
 
     /// Enable interrupts.
-    pub fn enable_interrupts(&mut self) {
-        self.inner.enable_interrupts()
+    pub fn enable_interrupts(&mut self, id: usize) {
+        self.inner.enable_interrupts(id)
     }
 
     /// Get MAC address.
@@ -61,13 +69,13 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
     }
 
     /// Whether can send packet.
-    pub fn can_send(&self) -> bool {
-        self.inner.can_send()
+    pub fn can_send(&self, id: usize) -> bool {
+        self.inner.can_send(id)
     }
 
     /// Whether can receive packet.
-    pub fn can_recv(&self) -> bool {
-        self.inner.poll_receive().is_some()
+    pub fn can_recv(&self, id: usize) -> bool {
+        self.inner.poll_receive(id).is_some()
     }
 
     /// Receives a [`RxBuffer`] from network. If currently no data, returns an
@@ -75,9 +83,9 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
     ///
     /// It will try to pop a buffer that completed data reception in the
     /// NIC queue.
-    pub fn receive(&mut self) -> Result<RxBuffer> {
-        if let Some(token) = self.inner.poll_receive() {
-            let mut rx_buf = self.rx_buffers[token as usize]
+    pub fn receive(&mut self, id: usize) -> Result<RxBuffer> {
+        if let Some(token) = self.inner.poll_receive(id) {
+            let mut rx_buf = self.rx_buffers[id][token as usize]
                 .take()
                 .ok_or(Error::WrongToken)?;
             if token != rx_buf.idx {
@@ -86,8 +94,10 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
 
             // Safe because `token` == `rx_buf.idx`, we are passing the same
             // buffer as we passed to `VirtQueue::add` and it is still valid.
-            let (_hdr_len, pkt_len) =
-                unsafe { self.inner.receive_complete(token, rx_buf.as_bytes_mut())? };
+            let (_hdr_len, pkt_len) = unsafe {
+                self.inner
+                    .receive_complete(id, token, rx_buf.as_bytes_mut())?
+            };
             rx_buf.set_packet_len(pkt_len);
             Ok(rx_buf)
         } else {
@@ -98,17 +108,17 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
     /// Gives back the ownership of `rx_buf`, and recycles it for next use.
     ///
     /// It will add the buffer back to the NIC queue.
-    pub fn recycle_rx_buffer(&mut self, mut rx_buf: RxBuffer) -> Result {
+    pub fn recycle_rx_buffer(&mut self, id: usize, mut rx_buf: RxBuffer) -> Result {
         // Safe because we take the ownership of `rx_buf` back to `rx_buffers`,
         // it lives as long as the queue.
-        let new_token = unsafe { self.inner.receive_begin(rx_buf.as_bytes_mut()) }?;
+        let new_token = unsafe { self.inner.receive_begin(id, rx_buf.as_bytes_mut()) }?;
         // `rx_buffers[new_token]` is expected to be `None` since it was taken
         // away at `Self::receive()` and has not been added back.
-        if self.rx_buffers[new_token as usize].is_some() {
+        if self.rx_buffers[id][new_token as usize].is_some() {
             return Err(Error::WrongToken);
         }
         rx_buf.idx = new_token;
-        self.rx_buffers[new_token as usize] = Some(rx_buf);
+        self.rx_buffers[id][new_token as usize] = Some(rx_buf);
         Ok(())
     }
 
@@ -119,7 +129,7 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONet<H, T, QUEUE_SIZE> 
 
     /// Sends a [`TxBuffer`] to the network, and blocks until the request
     /// completed.
-    pub fn send(&mut self, tx_buf: TxBuffer) -> Result {
-        self.inner.send(tx_buf.packet())
+    pub fn send(&mut self, id: usize, tx_buf: TxBuffer) -> Result {
+        self.inner.send(id, tx_buf.packet())
     }
 }

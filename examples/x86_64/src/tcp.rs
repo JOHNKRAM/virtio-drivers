@@ -7,7 +7,7 @@ use core::{cell::RefCell, str::FromStr};
 
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{HardwareAddress, EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 use smoltcp::{socket::tcp, time::Instant};
 use virtio_drivers::device::net::{RxBuffer, VirtIONet};
 use virtio_drivers::{transport::Transport, Error};
@@ -40,19 +40,19 @@ impl<T: Transport> Device for DeviceWrapper<T> {
     type RxToken<'a> = VirtioRxToken<T> where Self: 'a;
     type TxToken<'a> = VirtioTxToken<T> where Self: 'a;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        match self.inner.borrow_mut().receive() {
+    fn receive(&self, _timestamp: Instant, id: usize) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        match self.inner.borrow_mut().receive(id) {
             Ok(buf) => Some((
-                VirtioRxToken(self.inner.clone(), buf),
-                VirtioTxToken(self.inner.clone()),
+                VirtioRxToken(self.inner.clone(), buf, id),
+                VirtioTxToken(self.inner.clone(), id),
             )),
             Err(Error::NotReady) => None,
             Err(err) => panic!("receive failed: {}", err),
         }
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(VirtioTxToken(self.inner.clone()))
+    fn transmit(&self, _timestamp: Instant, id: usize) -> Option<Self::TxToken<'_>> {
+        Some(VirtioTxToken(self.inner.clone(), id))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -64,8 +64,8 @@ impl<T: Transport> Device for DeviceWrapper<T> {
     }
 }
 
-struct VirtioRxToken<T: Transport>(Rc<RefCell<DeviceImpl<T>>>, RxBuffer);
-struct VirtioTxToken<T: Transport>(Rc<RefCell<DeviceImpl<T>>>);
+struct VirtioRxToken<T: Transport>(Rc<RefCell<DeviceImpl<T>>>, RxBuffer, usize);
+struct VirtioTxToken<T: Transport>(Rc<RefCell<DeviceImpl<T>>>, usize);
 
 impl<T: Transport> RxToken for VirtioRxToken<T> {
     fn consume<R, F>(self, f: F) -> R
@@ -73,13 +73,14 @@ impl<T: Transport> RxToken for VirtioRxToken<T> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut rx_buf = self.1;
+        let id = self.2;
         trace!(
             "RECV {} bytes: {:02X?}",
             rx_buf.packet_len(),
             rx_buf.packet()
         );
         let result = f(rx_buf.packet_mut());
-        self.0.borrow_mut().recycle_rx_buffer(rx_buf).unwrap();
+        self.0.borrow_mut().recycle_rx_buffer(id, rx_buf).unwrap();
         result
     }
 }
@@ -90,10 +91,11 @@ impl<T: Transport> TxToken for VirtioTxToken<T> {
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut dev = self.0.borrow_mut();
+        let id = self.1;
         let mut tx_buf = dev.new_tx_buffer(len);
         let result = f(tx_buf.packet_mut());
         trace!("SEND {} bytes: {:02X?}", len, tx_buf.packet());
-        dev.send(tx_buf).unwrap();
+        dev.send(id, tx_buf).unwrap();
         result
     }
 }
@@ -102,11 +104,8 @@ pub fn test_echo_server<T: Transport>(dev: DeviceImpl<T>) {
     let mut device = DeviceWrapper::new(dev);
 
     // Create interface
-    let mut config = Config::new();
+    let mut config = Config::new(HardwareAddress::Ethernet(device.mac_address()));
     config.random_seed = 0x2333;
-    if device.capabilities().medium == Medium::Ethernet {
-        config.hardware_addr = Some(device.mac_address().into());
-    }
 
     let mut iface = Interface::new(config, &mut device);
     iface.update_ip_addrs(|ip_addrs| {

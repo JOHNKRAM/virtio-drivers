@@ -124,6 +124,53 @@ pub struct VirtioNetHdr {
     // payload starts from here
 }
 
+#[repr(C)]
+#[derive(AsBytes)]
+struct VirtioNetCtrlHdr {
+    class: VirtioNetCtrlClass,
+    cmd: VirtioNetCtrlCmd,
+}
+
+#[repr(transparent)]
+#[derive(AsBytes)]
+struct VirtioNetCtrlClass(u8);
+
+impl VirtioNetCtrlClass {
+    const MQ: VirtioNetCtrlClass = VirtioNetCtrlClass(4);
+}
+
+#[repr(transparent)]
+#[derive(AsBytes)]
+struct VirtioNetCtrlCmd(u8);
+
+impl VirtioNetCtrlCmd {
+    const MQ_VQ_PAIRS_SET: VirtioNetCtrlCmd = VirtioNetCtrlCmd(0);
+}
+
+#[repr(transparent)]
+#[derive(AsBytes, PartialEq, Eq, PartialOrd, Ord)]
+struct VirtioNetCtrlMQPairsSet(u16);
+
+impl VirtioNetCtrlMQPairsSet {
+    const MIN: VirtioNetCtrlMQPairsSet = VirtioNetCtrlMQPairsSet(1);
+    const MAX: VirtioNetCtrlMQPairsSet = VirtioNetCtrlMQPairsSet(0x8000);
+}
+
+#[repr(transparent)]
+#[derive(AsBytes, Copy, Clone, Eq, FromBytes, FromZeroes, PartialEq)]
+struct VirtioNetCtrlResult(u8);
+
+impl VirtioNetCtrlResult {
+    const OK: VirtioNetCtrlResult = VirtioNetCtrlResult(0);
+    const ERR: VirtioNetCtrlResult = VirtioNetCtrlResult(1);
+}
+
+impl Default for VirtioNetCtrlResult {
+    fn default() -> Self {
+        Self(u8::MAX)
+    }
+}
+
 #[derive(AsBytes, Copy, Clone, Debug, Default, Eq, FromBytes, FromZeroes, PartialEq)]
 #[repr(transparent)]
 struct Flags(u8);
@@ -152,4 +199,6 @@ const QUEUE_RECEIVE: u16 = 0;
 const QUEUE_TRANSMIT: u16 = 1;
 const SUPPORTED_FEATURES: Features = Features::MAC
     .union(Features::STATUS)
-    .union(Features::RING_EVENT_IDX);
+    .union(Features::RING_EVENT_IDX)
+    .union(Features::CTRL_VQ)
+    .union(Features::MQ);
